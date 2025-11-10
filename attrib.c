@@ -16,9 +16,6 @@
  * Copyright (c) 2010 Erik Larsson
  */
 
-#include 
-#include 
-
 #include "attrib.h"
 #include "attrlist.h"
 #include "lcnalloc.h"

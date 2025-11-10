@@ -7,14 +7,13 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-#include 
-
 #include "ntfs.h"
 #include "misc.h"
 #include "index.h"
 #include "reparse.h"
 #include "ea.h"
+#include <linux/exportfs.h>
+#include <linux/iversion.h>
 
 static inline int ntfs_check_bad_char(const unsigned short *wc,
 		unsigned int wc_len)

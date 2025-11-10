@@ -5,26 +5,28 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-#include 
-#include 
-
+#include <linux/fs.h>
+#include <linux/buffer_head.h>
+#include <linux/iomap.h>
+#include <linux/writeback.h>
+#include <linux/pagemap.h>
 #include "aops.h"
 #include "attrib.h"
 #include "mft.h"
 #include "ntfs.h"
 #include "misc.h"
+#include "inode.h"
 #include "ntfs_iomap.h"
 
-static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
-		unsigned int len, struct folio *folio)
+static void ntfs_iomap_zero_tails(struct inode *inode, loff_t pos,
+		unsigned int len, struct page *page)
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
 	unsigned long sector_size = 1UL << inode->i_blkbits;
 	loff_t start_down, end_up, init;
 
 	if (!NInoNonResident(ni))
-		goto out;
+		return;
 
 	start_down = round_down(pos, sector_size);
 	end_up = (pos + len - 1) | (sector_size - 1);
@@ -32,48 +34,41 @@ static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
 
 	if (init >= start_down && init <= end_up) {
 		if (init < pos) {
-			loff_t offset = offset_in_folio(folio, pos + len);
-
+			loff_t offset = offset_in_page(pos + len);
 			if (offset == 0)
-				offset = folio_size(folio);
-			folio_zero_segments(folio,
-					    offset_in_folio(folio, init),
-					    offset_in_folio(folio, pos),
-					    offset,
-					    folio_size(folio));
+				offset = PAGE_SIZE;
 
-		} else  {
-			loff_t offset = max_t(loff_t, pos + len, init);
-
-			offset = offset_in_folio(folio, offset);
-			if (offset == 0)
-				offset = folio_size(folio);
-			folio_zero_segment(folio,
+			zero_user_segments(page,
+					   offset_in_page(init),
+					   offset_in_page(pos),
 					   offset,
-					   folio_size(folio));
+					   PAGE_SIZE);
+		} else {
+			loff_t offset = max_t(loff_t, pos + len, init);
+			offset = offset_in_page(offset);
+
+			if (offset == 0)
+				offset = PAGE_SIZE;
+			
+			zero_user_segment(page,
+					  offset,
+					  PAGE_SIZE);
 		}
 	} else if (init <= pos) {
-		loff_t offset = 0, offset2 = offset_in_folio(folio, pos + len);
+		loff_t offset = 0, offset2 = offset_in_page(pos + len);
 
-		if ((init >> folio_shift(folio)) == (pos >> folio_shift(folio)))
-			offset = offset_in_folio(folio, init);
+		if ((init >> PAGE_SHIFT) == (pos >> PAGE_SHIFT))
+			offset = offset_in_page(init);
 		if (offset2 == 0)
-			offset2 = folio_size(folio);
-		folio_zero_segments(folio,
-				    offset,
-				    offset_in_folio(folio, pos),
-				    offset2,
-				    folio_size(folio));
+			offset2 = PAGE_SIZE;
+		
+		zero_user_segments(page,
+				   offset,
+				   offset_in_page(pos),
+				   offset2,
+				   PAGE_SIZE);
 	}
-
-out:
-	folio_unlock(folio);
-	folio_put(folio);
 }
-
-const struct iomap_write_ops ntfs_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
-};
 
 static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
@@ -235,7 +230,7 @@ static int ntfs_buffered_zeroed_clusters(struct inode *vi, s64 vcn)
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 	struct address_space *mapping = vi->i_mapping;
-	struct folio *folio;
+	struct page *page;
 	pgoff_t idx, idx_end;
 	u32 from, to;
 
@@ -243,33 +238,32 @@ static int ntfs_buffered_zeroed_clusters(struct inode *vi, s64 vcn)
 	idx_end = ((vcn + 1) << vol->cluster_size_bits) >> PAGE_SHIFT;
 	from = (vcn << vol->cluster_size_bits) & ~PAGE_MASK;
 	if (idx == idx_end)
-		idx_end++;
+		idx_end = idx + 1;
 
 	to = min_t(u32, vol->cluster_size, PAGE_SIZE);
 	for (; idx < idx_end; idx++, from = 0) {
 		if (to != PAGE_SIZE) {
-			folio = ntfs_read_mapping_folio(mapping, idx);
-			if (IS_ERR(folio))
-				return PTR_ERR(folio);
-			folio_lock(folio);
+			page = find_or_create_page(mapping, idx, mapping_gfp_mask(mapping));
+			if (IS_ERR(page))
+				return PTR_ERR(page);
+			lock_page(page);
 		} else {
-			folio = __filemap_get_folio(mapping, idx,
-					FGP_WRITEBEGIN | FGP_NOFS, mapping_gfp_mask(mapping));
-			if (IS_ERR(folio))
-				return PTR_ERR(folio);
+			page = grab_cache_page_write_begin(mapping, idx);
+			if (IS_ERR(page))
+				return PTR_ERR(page);
 		}
 
-		if (folio_test_uptodate(folio) ||
-		    iomap_is_partially_uptodate(folio, from, to))
-			goto next_folio;
+		if (PageUptodate(page) ||
+		    iomap_is_partially_uptodate((struct folio *)page, from, to))
+			goto next_page;
 
-		folio_zero_segment(folio, from, from + to);
-		folio_mark_uptodate(folio);
+		zero_user_segment(page, from, from + to);
+		SetPageUptodate(page);
 
-next_folio:
-		iomap_dirty_folio(mapping, folio);
-		folio_unlock(folio);
-		folio_put(folio);
+next_page:
+		set_page_dirty(page);
+		unlock_page(page);
+		put_page(page);
 		balance_dirty_pages_ratelimited(mapping);
 		cond_resched();
 	}
@@ -607,6 +601,12 @@ static int ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 		ssize_t written, unsigned int flags, struct iomap *iomap)
 {
+	if (written > 0 && iomap->type != IOMAP_INLINE) {
+		struct page *page = iomap->private;
+		if (page)
+			ntfs_iomap_zero_tails(inode, pos, written, page);
+	}
+
 	if (iomap->type == IOMAP_INLINE) {
 		struct page *ipage = iomap->private;
 		struct ntfs_inode *ni = NTFS_I(inode);
@@ -643,6 +643,7 @@ static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 err_out:
 		ntfs_attr_put_search_ctx(ctx);
 		put_page(ipage);
+		written = (written < 0) ? written : 0;
 		mutex_unlock(&ni->mrec_lock);
 	}
 
@@ -681,24 +682,23 @@ const struct iomap_ops ntfs_dio_iomap_ops = {
 	.iomap_end		= ntfs_write_iomap_end,
 };
 
-static ssize_t ntfs_writeback_range(struct iomap_writepage_ctx *wpc,
-		struct folio *folio, u64 offset, unsigned int len, u64 end_pos)
+static int ntfs_writeback_range(struct iomap_writepage_ctx *wpc,
+		struct inode *inode, loff_t pos, unsigned int len)
 {
-	if (offset < wpc->iomap.offset ||
-	    offset >= wpc->iomap.offset + wpc->iomap.length) {
+	if (pos < wpc->iomap.offset ||
+	    pos >= wpc->iomap.offset + wpc->iomap.length) {
 		int error;
 
-		error = __ntfs_write_iomap_begin(wpc->inode, offset,
-				NTFS_I(wpc->inode)->allocated_size - offset,
+		error = __ntfs_write_iomap_begin(inode, pos,
+				NTFS_I(inode)->allocated_size - pos,
 				IOMAP_WRITE, &wpc->iomap, true, false);
 		if (error)
 			return error;
 	}
 
-	return iomap_add_to_ioend(wpc, folio, offset, end_pos, len);
+	return 0;
 }
 
 const struct iomap_writeback_ops ntfs_writeback_ops = {
-	.writeback_range	= ntfs_writeback_range,
-	.writeback_submit	= iomap_ioend_writeback_submit,
+	.map_blocks = ntfs_writeback_range,
 };

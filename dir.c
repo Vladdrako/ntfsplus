@@ -5,9 +5,7 @@
  * Copyright (c) 2001-2007 Anton Altaparmakov
  * Copyright (c) 2002 Richard Russon
  * Copyright (c) 2025 LG Electronics Co., Ltd.
- */
-
-#include 
+ */ 
 
 #include "dir.h"
 #include "mft.h"

@@ -8,8 +8,6 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-
 #include "aops.h"
 #include "bitmap.h"
 #include "lcnalloc.h"

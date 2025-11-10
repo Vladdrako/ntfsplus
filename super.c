@@ -7,21 +7,21 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 	/* For bdev_logical_block_size(). */
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-
+#include <linux/fs.h>
+#include <linux/mount.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include "misc.h"
 #include "logfile.h"
 #include "index.h"
 #include "ntfs.h"
 #include "ea.h"
 #include "volume.h"
+#include <linux/blkdev.h>
+#include <linux/statfs.h> 
+#include <linux/exportfs.h>
+#include <linux/quotaops.h>
+#include "uapi/linux/ntfs.h"
 
 /* A global default upcase table and a corresponding reference count. */
 static __le16 *default_upcase;
