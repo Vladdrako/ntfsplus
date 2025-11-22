@@ -291,8 +291,7 @@ int ntfsp_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			if (NInoNonResident(NTFS_I(vi)) &&
 			    attr->ia_size < old_size) {
 				err = iomap_truncate_page(vi, attr->ia_size, NULL,
-							  &ntfs_read_iomap_ops,
-							  &ntfs_iomap_folio_ops, NULL);
+							  &ntfs_read_iomap_ops);
 				if (err)
 					goto out;
 			}
@@ -309,9 +308,8 @@ int ntfsp_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				loff_t len = min_t(loff_t,
 							round_up(old_size, PAGE_SIZE) - old_size,
 							attr->ia_size - old_size);
-				err = iomap_zero_range(vi, old_size, len,
-						       NULL, &ntfs_read_iomap_ops,
-						       &ntfs_iomap_folio_ops, NULL);
+				err = iomap_zero_range(vi, old_size, len, NULL,
+						       &ntfs_read_iomap_ops);
 			}
 		}
 		if (ia_valid == ATTR_SIZE)
@@ -628,8 +626,7 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			offset = iocb->ki_pos;
 			iocb->ki_flags &= ~IOCB_DIRECT;
 			written = iomap_file_buffered_write(iocb, from,
-					&ntfs_write_iomap_ops, &ntfs_iomap_folio_ops,
-					NULL);
+					&ntfs_write_iomap_ops, NULL);
 			if (written < 0) {
 				err = written;
 				goto out;
@@ -647,8 +644,7 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 							 end >> PAGE_SHIFT);
 		}
 	} else {
-		ret = iomap_file_buffered_write(iocb, from, &ntfs_write_iomap_ops,
-				&ntfs_iomap_folio_ops, NULL);
+		ret = iomap_file_buffered_write(iocb, from, &ntfs_write_iomap_ops, NULL);
 	}
 out:
 	if (ret < 0 && ret != -EIOCBQUEUED) {
@@ -681,7 +677,7 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 	sb_start_pagefault(inode->i_sb);
 	file_update_time(vmf->vma->vm_file);
 
-	ret = iomap_page_mkwrite(vmf, &ntfs_page_mkwrite_iomap_ops, NULL);
+	ret = iomap_page_mkwrite(vmf, &ntfs_page_mkwrite_iomap_ops);
 	sb_end_pagefault(inode->i_sb);
 	return ret;
 }
@@ -692,9 +688,8 @@ static const struct vm_operations_struct ntfs_file_vm_ops = {
 	.page_mkwrite	= ntfs_filemap_page_mkwrite,
 };
 
-static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
+static int ntfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct file *file = desc->file;
 	struct inode *inode = file_inode(file);
 
 	if (NVolShutdown(NTFS_SB(file->f_mapping->host->i_sb)))
@@ -703,14 +698,14 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 	if (NInoCompressed(NTFS_I(inode)))
 		return -EOPNOTSUPP;
 
-	if (desc->vm_flags & VM_WRITE) {
+	if (vma->vm_flags & VM_WRITE) {
 		struct inode *inode = file_inode(file);
 		loff_t from, to;
 		int err;
 
-		from = ((loff_t)desc->pgoff << PAGE_SHIFT);
+		from = ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
 		to = min_t(loff_t, i_size_read(inode),
-			   from + desc->end - desc->start);
+			   from + vma->vm_end - vma->vm_start);
 
 		if (NTFS_I(inode)->initialized_size < to) {
 			err = ntfs_extend_initialized_size(inode, to, to);
@@ -721,7 +716,7 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 
 
 	file_accessed(file);
-	desc->vm_ops = &ntfs_file_vm_ops;
+	vma->vm_ops = &ntfs_file_vm_ops;
 	return 0;
 }
 
@@ -1012,8 +1007,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 			to = min_t(loff_t, (start_vcn + 1) << vol->cluster_size_bits,
 				   end_offset);
 			err = iomap_zero_range(vi, offset, to - offset, NULL,
-					       &ntfs_read_iomap_ops,
-					       &ntfs_iomap_folio_ops, NULL);
+					       &ntfs_read_iomap_ops);
 			if (err < 0 || (end_vcn - start_vcn) == 1)
 				goto out;
 			start_vcn++;
@@ -1023,8 +1017,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 
 			from = (end_vcn - 1) << vol->cluster_size_bits;
 			err = iomap_zero_range(vi, from, end_offset - from, NULL,
-					       &ntfs_read_iomap_ops,
-					       &ntfs_iomap_folio_ops, NULL);
+					       &ntfs_read_iomap_ops);
 			if (err < 0 || (end_vcn - start_vcn) == 1)
 				goto out;
 			end_vcn--;
@@ -1075,8 +1068,7 @@ out:
 					   round_up(old_size, PAGE_SIZE) - old_size,
 					   offset - old_size);
 			err = iomap_zero_range(vi, old_size, len, NULL,
-					       &ntfs_read_iomap_ops,
-					       &ntfs_iomap_folio_ops, NULL);
+					       &ntfs_read_iomap_ops);
 		}
 		NInoSetFileNameDirty(ni);
 		inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
@@ -1092,7 +1084,7 @@ const struct file_operations ntfs_file_ops = {
 	.read_iter	= ntfs_file_read_iter,
 	.write_iter	= ntfs_file_write_iter,
 	.fsync		= ntfs_file_fsync,
-	.mmap_prepare	= ntfs_file_mmap_prepare,
+	.mmap		= ntfs_file_mmap,
 	.open		= ntfs_file_open,
 	.release	= ntfs_file_release,
 	.splice_read	= ntfs_file_splice_read,

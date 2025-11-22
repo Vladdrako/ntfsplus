@@ -71,7 +71,7 @@ out:
 	folio_put(folio);
 }
 
-const struct iomap_write_ops ntfs_iomap_folio_ops = {
+const struct iomap_folio_ops ntfs_iomap_folio_ops = {
 	.put_folio = ntfs_iomap_put_folio,
 };
 
@@ -677,24 +677,17 @@ const struct iomap_ops ntfs_dio_iomap_ops = {
 	.iomap_end		= ntfs_write_iomap_end,
 };
 
-static ssize_t ntfs_writeback_range(struct iomap_writepage_ctx *wpc,
-		struct folio *folio, u64 offset, unsigned int len, u64 end_pos)
+static int ntfs_iomap_map_blocks(struct iomap_writepage_ctx *wpc,
+		struct inode *inode, loff_t offset, unsigned int len)
 {
-	if (offset < wpc->iomap.offset ||
-	    offset >= wpc->iomap.offset + wpc->iomap.length) {
-		int error;
+	if (offset >= wpc->iomap.offset &&
+	    offset < wpc->iomap.offset + wpc->iomap.length)
+		return 0;
 
-		error = __ntfs_write_iomap_begin(wpc->inode, offset,
-				NTFS_I(wpc->inode)->allocated_size - offset,
-				IOMAP_WRITE, &wpc->iomap, true, false);
-		if (error)
-			return error;
-	}
-
-	return iomap_add_to_ioend(wpc, folio, offset, end_pos, len);
+	return __ntfs_write_iomap_begin(inode, offset, NTFS_I(inode)->allocated_size - offset,
+			IOMAP_WRITE, &wpc->iomap, true, false);
 }
 
 const struct iomap_writeback_ops ntfs_writeback_ops = {
-	.writeback_range	= ntfs_writeback_range,
-	.writeback_submit	= iomap_ioend_writeback_submit,
+	.map_blocks = ntfs_iomap_map_blocks,
 };

@@ -109,7 +109,7 @@ static void zero_partial_compressed_page(struct page *page,
 	unsigned int kp_ofs;
 
 	ntfs_debug("Zeroing page region outside initialized size.");
-	if (((s64)page->__folio_index << PAGE_SHIFT) >= initialized_size) {
+	if (((s64)page->index << PAGE_SHIFT) >= initialized_size) {
 		clear_page(kp);
 		return;
 	}
@@ -123,7 +123,7 @@ static void zero_partial_compressed_page(struct page *page,
 static inline void handle_bounds_compressed_page(struct page *page,
 		const loff_t i_size, const s64 initialized_size)
 {
-	if ((page->__folio_index >= (initialized_size >> PAGE_SHIFT)) &&
+	if ((page->index >= (initialized_size >> PAGE_SHIFT)) &&
 			(initialized_size < i_size))
 		zero_partial_compressed_page(page, initialized_size);
 }
@@ -470,7 +470,7 @@ int ntfs_read_compressed_block(struct folio *folio)
 	struct runlist_element *rl;
 	unsigned long flags;
 	u8 *cb, *cb_pos, *cb_end;
-	unsigned long offset, index = page->__folio_index;
+	unsigned long offset, index = folio->index;
 	u32 cb_size = ni->itype.compressed.block_size;
 	u64 cb_size_mask = cb_size - 1UL;
 	s64 vcn;
@@ -826,7 +826,7 @@ retry:
 		if (page) {
 			ntfs_error(vol->sb,
 				"Still have pages left! Terminating them with extreme prejudice.  Inode 0x%lx, page index 0x%lx.",
-				ni->mft_no, page->__folio_index);
+				ni->mft_no, page_folio(page)->index);
 			flush_dcache_page(page);
 			kunmap_local(page_address(page));
 			unlock_page(page);

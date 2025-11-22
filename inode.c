@@ -406,7 +406,7 @@ int ntfs_drop_big_inode(struct inode *inode)
 			return 0;
 	}
 
-	return inode_generic_drop(inode);
+	return generic_drop_inode(inode);
 }
 
 static inline struct ntfs_inode *ntfs_alloc_extent_inode(void)
@@ -2424,8 +2424,7 @@ int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 	if (!NInoCompressed(ni) && old_init_size < offset) {
 		err = iomap_zero_range(vi, old_init_size,
 				       offset - old_init_size,
-				       NULL, &ntfs_read_iomap_ops,
-				       &ntfs_iomap_folio_ops, NULL);
+				       NULL, &ntfs_read_iomap_ops);
 		if (err)
 			return err;
 	}

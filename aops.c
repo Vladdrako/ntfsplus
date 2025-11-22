@@ -447,11 +447,7 @@ static int ntfs_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(inode);
-	struct iomap_writepage_ctx wpc = {
-		.inode		= mapping->host,
-		.wbc		= wbc,
-		.ops		= &ntfs_writeback_ops,
-	};
+	struct iomap_writepage_ctx wpc = { };
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
@@ -474,7 +470,7 @@ static int ntfs_writepages(struct address_space *mapping,
 		return -EACCES;
 	}
 
-	return iomap_writepages(&wpc);
+	return iomap_writepages(mapping, wbc, &wpc, &ntfs_writeback_ops);
 }
 
 static int ntfs_swap_activate(struct swap_info_struct *sis,
