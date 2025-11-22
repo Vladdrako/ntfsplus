@@ -36,7 +36,7 @@ static s64 ntfs_convert_page_index_into_lcn(struct ntfs_volume *vol, struct ntfs
 	return lcn;
 }
 
-struct bio *ntfs_setup_bio(struct ntfs_volume *vol, unsigned int opf, s64 lcn,
+struct bio *ntfs_setup_bio(struct ntfs_volume *vol, blk_opf_t opf, s64 lcn,
 		unsigned int pg_ofs)
 {
 	struct bio *bio;
@@ -106,16 +106,12 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 	if (ni->type != AT_INDEX_ALLOCATION) {
 		/* If attribute is encrypted, deny access, just like NT4. */
 		if (NInoEncrypted(ni)) {
-			BUG_ON(ni->type != AT_DATA);
 			folio_unlock(folio);
 			return -EACCES;
 		}
 		/* Compressed data streams are handled in compress.c. */
-		if (NInoNonResident(ni) && NInoCompressed(ni)) {
-			BUG_ON(ni->type != AT_DATA);
-			BUG_ON(ni->name_len);
+		if (NInoNonResident(ni) && NInoCompressed(ni))
 			return ntfs_read_compressed_block(folio);
-		}
 	}
 
 	return iomap_read_folio(folio, &ntfs_read_iomap_ops);
@@ -133,7 +129,6 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 	unsigned long mft_no;
 	struct ntfs_inode *tni;
 	s64 lcn;
-	unsigned int lcn_folio_off = 0;
 	s64 vcn = (s64)folio->index << PAGE_SHIFT >> vol->cluster_size_bits;
 	s64 end_vcn = ni->allocated_size >> vol->cluster_size_bits;
 	unsigned int folio_sz;
@@ -141,18 +136,6 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 
 	ntfs_debug("Entering for inode 0x%lx, attribute type 0x%x, folio index 0x%lx.",
 			vi->i_ino, ni->type, folio->index);
-	BUG_ON(!NInoNonResident(ni));
-	BUG_ON(!NInoMstProtected(ni));
-
-	/*
-	 * NOTE: ntfs_write_mft_block() would be called for $MFTMirr if a page
-	 * in its page cache were to be marked dirty.  However this should
-	 * never happen with the current driver and considering we do not
-	 * handle this case here we do want to BUG(), at least for now.
-	 */
-
-	BUG_ON(!((S_ISREG(vi->i_mode) && !vi->i_ino) || S_ISDIR(vi->i_mode) ||
-		(NInoAttr(ni) && ni->type == AT_INDEX_ALLOCATION)));
 
 	lcn = ntfs_convert_page_index_into_lcn(vol, ni, folio->index);
 	if (lcn <= LCN_HOLE) {
@@ -160,11 +143,6 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		folio_unlock(folio);
 		folio_end_writeback(folio);
 		return -EIO;
-	}
-
-	if (vol->cluster_size_bits > PAGE_SHIFT) {
-		lcn_folio_off = folio->index << PAGE_SHIFT;
-		lcn_folio_off &= vol->cluster_size_mask;
 	}
 
 	/* Map folio so we can access its contents. */
@@ -177,6 +155,7 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		/* Get the mft record number. */
 		mft_no = (((s64)folio->index << PAGE_SHIFT) + mft_ofs) >>
 			vol->mft_record_size_bits;
+		vcn = mft_no << vol->mft_record_size_bits >> vol->cluster_size_bits;
 		/* Check whether to write this mft record. */
 		tni = NULL;
 		if (ntfs_may_write_mft_record(vol, mft_no,
@@ -200,7 +179,7 @@ flush_bio:
 				bio = NULL;
 			}
 
-			if (vol->cluster_size == NTFS_BLOCK_SIZE) {
+			if (vol->cluster_size < folio_size(folio)) {
 				down_write(&ni->runlist.lock);
 				rl = ntfs_attr_vcn_to_rl(ni, vcn_off, &lcn);
 				up_write(&ni->runlist.lock);
@@ -208,13 +187,22 @@ flush_bio:
 					err = -EIO;
 					goto unm_done;
 				}
+
+				if (bio &&
+				   (bio_end_sector(bio) >> (vol->cluster_size_bits - 9)) !=
+				    lcn) {
+					flush_dcache_folio(folio);
+					submit_bio_wait(bio);
+					bio_put(bio);
+					bio = NULL;
+				}
 			}
 
 			if (!bio) {
-				unsigned int off = lcn_folio_off;
+				unsigned int off;
 
-				if (vol->cluster_size != NTFS_BLOCK_SIZE)
-					off += mft_ofs;
+				off = ((mft_no << vol->mft_record_size_bits) +
+				       mft_record_off) & vol->cluster_size_mask;
 
 				bio = ntfs_setup_bio(vol, REQ_OP_WRITE, lcn, off);
 				if (!bio) {
@@ -223,7 +211,10 @@ flush_bio:
 				}
 			}
 
-			if (vol->cluster_size == NTFS_BLOCK_SIZE && rl->length == 1)
+			if (vol->cluster_size == NTFS_BLOCK_SIZE &&
+			    (mft_record_off ||
+			     rl->length - (vcn_off - rl->vcn) == 1 ||
+			     mft_ofs + NTFS_BLOCK_SIZE >= PAGE_SIZE))
 				folio_sz = NTFS_BLOCK_SIZE;
 			else
 				folio_sz = vol->mft_record_size;
@@ -233,20 +224,19 @@ flush_bio:
 				bio_put(bio);
 				goto unm_done;
 			}
-			prev_mft_ofs = mft_ofs;
 			mft_record_off += folio_sz;
 
 			if (mft_record_off != vol->mft_record_size) {
 				vcn_off++;
 				goto flush_bio;
 			}
+			prev_mft_ofs = mft_ofs;
 
 			if (mft_no < vol->mftmirr_size)
 				ntfs_sync_mft_mirror(vol, mft_no,
 						(struct mft_record *)(kaddr + mft_ofs));
 		}
 
-		vcn += vol->mft_record_size >> vol->cluster_size_bits;
 	}
 
 	if (bio) {
@@ -274,10 +264,8 @@ unm_done:
 		mutex_lock(&tni->extent_lock);
 		if (tni->nr_extents >= 0)
 			base_tni = tni;
-		else {
+		else
 			base_tni = tni->ext.base_ntfs_ino;
-			BUG_ON(!base_tni);
-		}
 		mutex_unlock(&tni->extent_lock);
 		ntfs_debug("Unlocking %s inode 0x%lx.",
 				tni == base_tni ? "base" : "extent",
@@ -337,8 +325,6 @@ static sector_t ntfs_bmap(struct address_space *mapping, sector_t block)
 		return 0;
 	}
 	/* None of these can happen. */
-	BUG_ON(NInoCompressed(ni));
-	BUG_ON(NInoMstProtected(ni));
 	blocksize = vol->sb->s_blocksize;
 	blocksize_bits = vol->sb->s_blocksize_bits;
 	ofs = (s64)block << blocksize_bits;

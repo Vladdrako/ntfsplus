@@ -7,7 +7,7 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
+#include <linux/blkdev.h>
 
 #include "dir.h"
 #include "mft.h"
@@ -82,8 +82,6 @@ u64 ntfs_lookup_inode_by_name(struct ntfs_inode *dir_ni, const __le16 *uname,
 	u8 *kaddr = NULL;
 	struct ntfs_name *name = NULL;
 
-	BUG_ON(!S_ISDIR(VFS_I(dir_ni)->i_mode));
-	BUG_ON(NInoAttr(dir_ni));
 	/* Get hold of the mft record for the directory. */
 	m = map_mft_record(dir_ni);
 	if (IS_ERR(m)) {
@@ -643,6 +641,11 @@ static inline int ntfs_filldir(struct ntfs_volume *vol,
 		ntfs_debug("Skipping system file.");
 		return 0;
 	}
+	if (!NVolShowHiddenFiles(vol) &&
+	    (ie->key.file_name.file_attributes & FILE_ATTR_HIDDEN)) {
+		ntfs_debug("Skipping hidden file.");
+		return 0;
+	}
 
 	name_len = ntfs_ucstonls(vol, (__le16 *)&ie->key.file_name.file_name,
 			ie->key.file_name.file_name_length, &name,
@@ -706,7 +709,7 @@ static void ntfs_insert_rb(struct ntfs_index_ra *nir, struct rb_root *root)
 		else {
 			pr_err("nir start index : %ld, count : %d, cnir start_index : %ld, count : %d\n",
 				nir->start_index, nir->count, cnir->start_index, cnir->count);
-			BUG_ON(1);
+			return;
 		}
 	}
 
@@ -1178,7 +1181,6 @@ static int ntfs_dir_fsync(struct file *filp, loff_t start, loff_t end,
 		return err;
 	inode_lock(vi);
 
-	BUG_ON(!S_ISDIR(vi->i_mode));
 	/* If the bitmap attribute inode is in memory sync it, too. */
 	na.mft_no = vi->i_ino;
 	na.type = AT_BITMAP;
@@ -1219,8 +1221,8 @@ const struct file_operations ntfs_dir_ops = {
 	.fsync		= ntfs_dir_fsync,	/* Sync a directory to disk. */
 	.open		= ntfs_dir_open,	/* Open directory. */
 	.release	= ntfs_dir_release,
-	.unlocked_ioctl	= ntfs_ioctl,
+	.unlocked_ioctl	= ntfsp_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	= ntfs_compat_ioctl,
+	.compat_ioctl	= ntfsp_compat_ioctl,
 #endif
 };

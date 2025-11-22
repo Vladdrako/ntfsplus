@@ -21,7 +21,7 @@
 #include "misc.h"
 
 static int ntfs_write_ea(struct ntfs_inode *ni, int type, char *value, s64 ea_off,
-		s64 ea_size)
+		s64 ea_size, bool need_truncate)
 {
 	struct inode *ea_vi;
 	int err = 0;
@@ -34,8 +34,13 @@ static int ntfs_write_ea(struct ntfs_inode *ni, int type, char *value, s64 ea_of
 	written = ntfs_inode_attr_pwrite(ea_vi, ea_off, ea_size, value, false);
 	if (written != ea_size)
 		err = -EIO;
-	else
+	else {
+		struct ntfs_inode *ea_ni = NTFS_I(ea_vi);
+
+		if (need_truncate && ea_ni->data_size > ea_off + ea_size)
+			ntfs_attr_truncate(ea_ni, ea_off + ea_size);
 		mark_mft_record_dirty(ni);
+	}
 
 	iput(ea_vi);
 	return err;
@@ -207,7 +212,7 @@ static int ntfs_set_ea(struct inode *inode, const char *name, size_t name_len,
 			goto create_ea_info;
 		}
 
-		ea_info_qsize = le16_to_cpu(p_ea_info->ea_query_length);
+		ea_info_qsize = le32_to_cpu(p_ea_info->ea_query_length);
 	} else {
 create_ea_info:
 		p_ea_info = ntfs_malloc_nofs(sizeof(struct ea_information));
@@ -257,15 +262,14 @@ create_ea_info:
 
 		memmove((char *)p_ea, (char *)p_ea + ea_size, ea_info_qsize - (ea_off + ea_size));
 		ea_info_qsize -= ea_size;
-		memset(ea_buf + ea_info_qsize, 0, ea_size);
 		p_ea_info->ea_query_length = cpu_to_le16(ea_info_qsize);
 
 		err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
-				sizeof(struct ea_information));
+				sizeof(struct ea_information), false);
 		if (err)
 			goto out;
 
-		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, all_ea_size);
+		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, ea_info_qsize, true);
 		if (err)
 			goto out;
 
@@ -321,13 +325,13 @@ alloc_new_ea:
 			goto out;
 	} else {
 		err = ntfs_write_ea(ni, AT_EA, (char *)p_ea, ea_info_qsize,
-				new_ea_size);
+				new_ea_size, false);
 		if (err)
 			goto out;
 	}
 
 	err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
-			sizeof(struct ea_information));
+			sizeof(struct ea_information), false);
 	if (err)
 		goto out;
 
@@ -433,7 +437,7 @@ int ntfs_ea_set_wsl_inode(struct inode *inode, dev_t rdev, __le16 *ea_size,
 	return err;
 }
 
-ssize_t ntfs_listxattr(struct dentry *dentry, char *buffer, size_t size)
+ssize_t ntfsp_listxattr(struct dentry *dentry, char *buffer, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	struct ntfs_inode *ni = NTFS_I(inode);
@@ -506,6 +510,12 @@ out:
 	return err ? err : ret;
 }
 
+// clang-format off
+#define SYSTEM_DOS_ATTRIB     "system.dos_attrib"
+#define SYSTEM_NTFS_ATTRIB    "system.ntfs_attrib"
+#define SYSTEM_NTFS_ATTRIB_BE "system.ntfs_attrib_be"
+// clang-format on
+
 static int ntfs_getxattr(const struct xattr_handler *handler,
 		struct dentry *unused, struct inode *inode, const char *name,
 		void *buffer, size_t size)
@@ -513,10 +523,171 @@ static int ntfs_getxattr(const struct xattr_handler *handler,
 	struct ntfs_inode *ni = NTFS_I(inode);
 	int err;
 
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	if (!strcmp(name, SYSTEM_DOS_ATTRIB)) {
+		if (!buffer) {
+			err = sizeof(u8);
+		} else if (size < sizeof(u8)) {
+			err = -ENODATA;
+		} else {
+			err = sizeof(u8);
+			*(u8 *)buffer = ni->flags;
+		}
+		goto out;
+	}
+
+	if (!strcmp(name, SYSTEM_NTFS_ATTRIB) ||
+	    !strcmp(name, SYSTEM_NTFS_ATTRIB_BE)) {
+		if (!buffer) {
+			err = sizeof(u32);
+		} else if (size < sizeof(u32)) {
+			err = -ENODATA;
+		} else {
+			err = sizeof(u32);
+			*(u32 *)buffer = le32_to_cpu(ni->flags);
+			if (!strcmp(name, SYSTEM_NTFS_ATTRIB_BE))
+				*(__be32 *)buffer = cpu_to_be32(*(u32 *)buffer);
+		}
+		goto out;
+	}
+
 	mutex_lock(&ni->mrec_lock);
 	err = ntfs_get_ea(inode, name, strlen(name), buffer, size);
 	mutex_unlock(&ni->mrec_lock);
 
+out:
+	return err;
+}
+
+static int ntfs_new_attr_flags(struct ntfs_inode *ni, __le32 fattr)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct mft_record *m;
+	struct attr_record *a;
+	__le16 new_aflags;
+	int mp_size, mp_ofs, name_ofs, arec_size, err;
+
+	m = map_mft_record(ni);
+	if (IS_ERR(m))
+		return PTR_ERR(m);
+
+	ctx = ntfs_attr_get_search_ctx(ni, m);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto err_out;
+	}
+
+	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			CASE_SENSITIVE, 0, NULL, 0, ctx);
+	if (err) {
+		err = -EINVAL;
+		goto err_out;
+	}
+
+	a = ctx->attr;
+	new_aflags = ctx->attr->flags;
+
+	if (fattr & FILE_ATTR_SPARSE_FILE)
+		new_aflags |= ATTR_IS_SPARSE;
+	else
+		new_aflags &= ~ATTR_IS_SPARSE;
+
+	if (fattr & FILE_ATTR_COMPRESSED)
+		new_aflags |= ATTR_IS_COMPRESSED;
+	else
+		new_aflags &= ~ATTR_IS_COMPRESSED;
+
+	if (new_aflags == a->flags)
+		return 0;
+
+	if ((new_aflags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) ==
+			  (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) {
+		pr_err("file can't be sparsed and compressed\n");
+		err = -EOPNOTSUPP;
+		goto err_out;
+	}
+
+	if (!a->non_resident)
+		goto out;
+
+	if (a->data.non_resident.data_size) {
+		pr_err("Can't change sparsed/compressed for non-empty file");
+		err = -EOPNOTSUPP;
+		goto err_out;
+	}
+
+	if (new_aflags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED))
+		name_ofs = (offsetof(struct attr_record,
+				     data.non_resident.compressed_size) +
+					sizeof(a->data.non_resident.compressed_size) + 7) & ~7;
+	else
+		name_ofs = (offsetof(struct attr_record,
+				     data.non_resident.compressed_size) + 7) & ~7;
+
+	mp_size = ntfs_get_size_for_mapping_pairs(ni->vol, ni->runlist.rl, 0, -1, -1);
+	if (unlikely(mp_size < 0)) {
+		err = mp_size;
+		ntfs_debug("Failed to get size for mapping pairs array, error code %i.\n", err);
+		goto err_out;
+	}
+
+	mp_ofs = (name_ofs + a->name_length * sizeof(__le16) + 7) & ~7;
+	arec_size = (mp_ofs + mp_size + 7) & ~7;
+
+	err = ntfs_attr_record_resize(m, a, arec_size);
+	if (unlikely(err))
+		goto err_out;
+
+	if (new_aflags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) {
+		a->data.non_resident.compression_unit = 0;
+		if (new_aflags & ATTR_IS_COMPRESSED || ni->vol->major_ver < 3)
+			a->data.non_resident.compression_unit = 4;
+		a->data.non_resident.compressed_size = 0;
+		ni->itype.compressed.size = 0;
+		if (a->data.non_resident.compression_unit) {
+			ni->itype.compressed.block_size = 1U <<
+				(a->data.non_resident.compression_unit +
+				 ni->vol->cluster_size_bits);
+			ni->itype.compressed.block_size_bits =
+					ffs(ni->itype.compressed.block_size) -
+					1;
+			ni->itype.compressed.block_clusters = 1U <<
+					a->data.non_resident.compression_unit;
+		} else {
+			ni->itype.compressed.block_size = 0;
+			ni->itype.compressed.block_size_bits = 0;
+			ni->itype.compressed.block_clusters = 0;
+		}
+
+		if (new_aflags & ATTR_IS_SPARSE) {
+			NInoSetSparse(ni);
+			ni->flags |= FILE_ATTR_SPARSE_FILE;
+		}
+
+		if (new_aflags & ATTR_IS_COMPRESSED) {
+			NInoSetCompressed(ni);
+			ni->flags |= FILE_ATTR_COMPRESSED;
+			VFS_I(ni)->i_mapping->a_ops = &ntfs_compressed_aops;
+		}
+	} else {
+		ni->flags &= ~(FILE_ATTR_SPARSE_FILE | FILE_ATTR_COMPRESSED);
+		a->data.non_resident.compression_unit = 0;
+		VFS_I(ni)->i_mapping->a_ops = &ntfs_normal_aops;
+		NInoClearSparse(ni);
+		NInoClearCompressed(ni);
+	}
+
+	a->name_offset = cpu_to_le16(name_ofs);
+	a->data.non_resident.mapping_pairs_offset = cpu_to_le16(mp_ofs);
+
+out:
+	a->flags = new_aflags;
+	mark_mft_record_dirty(ctx->ntfs_ino);
+err_out:
+	ntfs_attr_put_search_ctx(ctx);
+	unmap_mft_record(ni);
 	return err;
 }
 
@@ -527,11 +698,59 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
 	int err;
+	__le32 fattr;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	if (!strcmp(name, SYSTEM_DOS_ATTRIB)) {
+		if (sizeof(u8) != size)
+			goto out;
+		fattr = cpu_to_le32(*(u8 *)value);
+		goto set_fattr;
+	}
+
+	if (!strcmp(name, SYSTEM_NTFS_ATTRIB) ||
+	    !strcmp(name, SYSTEM_NTFS_ATTRIB_BE)) {
+		if (size != sizeof(u32))
+			goto out;
+		if (!strcmp(name, SYSTEM_NTFS_ATTRIB_BE))
+			fattr = cpu_to_le32(be32_to_cpu(*(__be32 *)value));
+		else
+			fattr = cpu_to_le32(*(u32 *)value);
+
+		if (S_ISREG(inode->i_mode)) {
+			mutex_lock(&ni->mrec_lock);
+			err = ntfs_new_attr_flags(ni, fattr);
+			mutex_unlock(&ni->mrec_lock);
+			if (err)
+				goto out;
+		}
+
+set_fattr:
+		if (S_ISDIR(inode->i_mode))
+			fattr |= FILE_ATTR_DIRECTORY;
+		else
+			fattr &= ~FILE_ATTR_DIRECTORY;
+
+		if (ni->flags != fattr) {
+			ni->flags = fattr;
+			if (fattr & FILE_ATTR_READONLY)
+				inode->i_mode &= ~0222;
+			else
+				inode->i_mode |= 0222;
+			NInoSetFileNameDirty(ni);
+			mark_inode_dirty(inode);
+		}
+		err = 0;
+		goto out;
+	}
 
 	mutex_lock(&ni->mrec_lock);
 	err = ntfs_set_ea(inode, name, strlen(name), value, size, flags, NULL);
 	mutex_unlock(&ni->mrec_lock);
 
+out:
 	inode_set_ctime_current(inode);
 	mark_inode_dirty(inode);
 	return err;
@@ -550,14 +769,14 @@ static const struct xattr_handler ntfs_other_xattr_handler = {
 	.list	= ntfs_xattr_user_list,
 };
 
-const struct xattr_handler * const ntfs_xattr_handlers[] = {
+const struct xattr_handler * const ntfsp_xattr_handlers[] = {
 	&ntfs_other_xattr_handler,
 	NULL,
 };
 // clang-format on
 
 #ifdef CONFIG_NTFSPLUS_FS_POSIX_ACL
-struct posix_acl *ntfs_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+struct posix_acl *ntfsp_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 			       int type)
 {
 	struct inode *inode = d_inode(dentry);
@@ -674,13 +893,13 @@ out:
 	return err;
 }
 
-int ntfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+int ntfsp_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type)
 {
 	return ntfs_set_acl_ex(idmap, d_inode(dentry), acl, type, false);
 }
 
-int ntfs_init_acl(struct mnt_idmap *idmap, struct inode *inode,
+int ntfsp_init_acl(struct mnt_idmap *idmap, struct inode *inode,
 		  struct inode *dir)
 {
 	struct posix_acl *default_acl, *acl;

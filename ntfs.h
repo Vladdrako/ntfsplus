@@ -24,6 +24,12 @@
 #include "layout.h"
 #include "inode.h"
 
+#ifdef pr_fmt
+#undef pr_fmt
+#endif
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #define NTFS_DEF_PREALLOC_SIZE		(64*1024*1024)
 
 #define STANDARD_COMPRESSION_UNIT	4
@@ -36,6 +42,7 @@ enum {
 	NTFS_BLOCK_SIZE_BITS	= 9,
 	NTFS_SB_MAGIC		= 0x5346544e,	/* 'NTFS' */
 	NTFS_MAX_NAME_LEN	= 255,
+	NTFS_MAX_LABEL_LEN	= 128,
 };
 
 enum {
@@ -60,7 +67,7 @@ extern const struct address_space_operations ntfs_mst_aops;
 extern const struct  file_operations ntfs_file_ops;
 extern const struct inode_operations ntfs_file_inode_ops;
 extern const  struct inode_operations ntfs_symlink_inode_operations;
-extern const struct inode_operations ntfs_special_inode_operations;
+extern const struct inode_operations ntfsp_special_inode_operations;
 
 extern const struct  file_operations ntfs_dir_ops;
 extern const struct inode_operations ntfs_dir_inode_ops;
@@ -101,6 +108,7 @@ struct option_t {
 extern const struct option_t on_errors_arr[];
 int ntfs_set_volume_flags(struct ntfs_volume *vol, __le16 flags);
 int ntfs_clear_volume_flags(struct ntfs_volume *vol, __le16 flags);
+int ntfs_write_volume_label(struct ntfs_volume *vol, char *label);
 
 /* From fs/ntfs/mst.c */
 int post_read_mst_fixup(struct ntfs_record *b, const u32 size);
@@ -133,9 +141,9 @@ bool ntfs_names_are_equal(const __le16 *s1, size_t s1_len,
 		const u32 ic,
 		const __le16 *upcase, const u32 upcase_size);
 int ntfs_force_shutdown(struct super_block *sb, u32 flags);
-long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_COMPAT
-long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
+long ntfsp_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg);
 #endif
 

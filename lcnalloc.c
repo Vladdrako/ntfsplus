@@ -194,17 +194,14 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 	ntfs_debug("Entering for start_vcn 0x%llx, count 0x%llx, start_lcn 0x%llx, zone %s_ZONE.",
 			start_vcn, count, start_lcn,
 			zone == MFT_ZONE ? "MFT" : "DATA");
-	BUG_ON(!vol);
+
 	lcnbmp_vi = vol->lcnbmp_ino;
-	BUG_ON(!lcnbmp_vi);
-	BUG_ON(start_vcn < 0);
-	BUG_ON(count < 0);
-	BUG_ON(start_lcn < LCN_HOLE);
-	BUG_ON(zone < FIRST_ZONE);
-	BUG_ON(zone > LAST_ZONE);
+	if (start_vcn < 0 || start_lcn < LCN_HOLE ||
+	    zone < FIRST_ZONE || zone > LAST_ZONE)
+		return ERR_PTR(-EINVAL);
 
 	/* Return NULL if @count is zero. */
-	if (!count)
+	if (count < 0 || !count)
 		return ERR_PTR(-EINVAL);
 
 	memalloc_flags = memalloc_nofs_save();
@@ -257,40 +254,27 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 			pass = 2;
 		}
 		has_guess = 0;
-	} else if (zone == DATA_ZONE && zone_start >= vol->mft_zone_start &&
-			zone_start < vol->mft_zone_end) {
-		zone_start = vol->mft_zone_end;
-		/*
-		 * Starting at beginning of data1_zone which means a single
-		 * pass in this zone is sufficient.
-		 */
-		pass = 2;
-	} else if (zone == MFT_ZONE && (zone_start < vol->mft_zone_start ||
-			zone_start >= vol->mft_zone_end)) {
-		zone_start = vol->mft_lcn;
-		if (!vol->mft_zone_end)
-			zone_start = 0;
-		/*
-		 * Starting at beginning of volume which means a single pass
-		 * is sufficient.
-		 */
-		pass = 2;
 	}
 
-	if (zone == MFT_ZONE) {
-		zone_end = vol->mft_zone_end;
-		search_zone = 1;
-	} else /* if (zone == DATA_ZONE) */ {
+	if (!zone_start || zone_start == vol->mft_zone_start ||
+			zone_start == vol->mft_zone_end)
+		pass = 2;
+
+	if (zone_start < vol->mft_zone_start) {
+		zone_end = vol->mft_zone_start;
+		search_zone = 4;
 		/* Skip searching the mft zone. */
 		done_zones |= 1;
-		if (zone_start >= vol->mft_zone_end) {
-			zone_end = vol->nr_clusters;
-			search_zone = 2;
-		} else {
-			zone_end = vol->mft_zone_start;
-			search_zone = 4;
-		}
+	} else if (zone_start < vol->mft_zone_end) {
+		zone_end = vol->mft_zone_end;
+		search_zone = 1;
+	} else {
+		zone_end = vol->nr_clusters;
+		search_zone = 2;
+		/* Skip searching the mft zone. */
+		done_zones |= 1;
 	}
+
 	/*
 	 * bmp_pos is the current bit position inside the bitmap.  We use
 	 * bmp_initial_pos to determine whether or not to do a zone switch.
@@ -493,7 +477,7 @@ done:
 							vol->data2_zone_pos);
 					break;
 				default:
-					BUG();
+					WARN_ON(1);
 				}
 				ntfs_debug("Finished.  Going to out.");
 				goto out;
@@ -529,7 +513,7 @@ zone_pass_done:	/* Finished with the current zone pass. */
 				zone_start = 0;
 				break;
 			default:
-				BUG();
+				WARN_ON(1);
 			}
 			/* Sanity check. */
 			if (zone_end < zone_start)
@@ -641,7 +625,7 @@ switch_to_data1_zone:		search_zone = 2;
 				/* Switch from data2 zone to data1 zone. */
 				goto switch_to_data1_zone;
 			default:
-				BUG();
+				WARN_ON(1);
 			}
 			ntfs_debug("After zone switch, search_zone %i, pass %i, bmp_initial_pos 0x%llx, zone_start 0x%llx, zone_end 0x%llx.",
 					search_zone, pass,
@@ -823,15 +807,13 @@ s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn, s64 count,
 	int err;
 	unsigned int memalloc_flags;
 
-	BUG_ON(!ni);
 	ntfs_debug("Entering for i_ino 0x%lx, start_vcn 0x%llx, count 0x%llx.%s",
 			ni->mft_no, start_vcn, count,
 			is_rollback ? " (rollback)" : "");
 	vol = ni->vol;
 	lcnbmp_vi = vol->lcnbmp_ino;
-	BUG_ON(!lcnbmp_vi);
-	BUG_ON(start_vcn < 0);
-	BUG_ON(count < -1);
+	if (start_vcn < 0 || count < -1)
+		return -EINVAL;
 
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
@@ -959,7 +941,7 @@ s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn, s64 count,
 		memalloc_nofs_restore(memalloc_flags);
 	}
 
-	BUG_ON(count > 0);
+	WARN_ON(count > 0);
 
 	/* We are done.  Return the number of actually freed clusters. */
 	ntfs_debug("Done.");

@@ -6,8 +6,8 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-#include 
+#include <linux/writeback.h>
+#include <linux/seq_file.h>
 
 #include "lcnalloc.h"
 #include "misc.h"
@@ -103,11 +103,8 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	atomic_set(&ni->count, 1);
 
 	/* If initializing a normal inode, we are done. */
-	if (likely(na->type == AT_UNUSED)) {
-		BUG_ON(na->name);
-		BUG_ON(na->name_len);
+	if (likely(na->type == AT_UNUSED))
 		return 0;
-	}
 
 	/* It is a fake inode. */
 	NInoSetAttr(ni);
@@ -122,7 +119,6 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	if (na->name_len && na->name != I30) {
 		unsigned int i;
 
-		BUG_ON(!na->name);
 		i = na->name_len * sizeof(__le16);
 		ni->name = kmalloc(i + sizeof(__le16), GFP_ATOMIC);
 		if (!ni->name)
@@ -219,7 +215,7 @@ struct inode *ntfs_attr_iget(struct inode *base_vi, __le32 type,
 	struct ntfs_attr na;
 
 	/* Make sure no one calls ntfs_attr_iget() for indices. */
-	BUG_ON(type == AT_INDEX_ALLOCATION);
+	WARN_ON(type == AT_INDEX_ALLOCATION);
 
 	na.mft_no = base_vi->i_ino;
 	na.type = type;
@@ -334,7 +330,7 @@ static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
 	actx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!actx)
 		return -ENOMEM;
-	BUG_ON(actx->mrec->link_count != 0);
+	WARN_ON(actx->mrec->link_count != 0);
 
 	/**
 	 * ntfs_truncate_vfs cannot be called in evict() context due
@@ -432,7 +428,7 @@ static void ntfs_destroy_extent_inode(struct ntfs_inode *ni)
 	ntfs_debug("Entering.");
 
 	if (!atomic_dec_and_test(&ni->count))
-		BUG();
+		WARN_ON(1);
 	if (ni->folio)
 		ntfs_unmap_folio(ni->folio, NULL);
 	kfree(ni->mrec);
@@ -632,7 +628,7 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 		inode->i_op = &ntfs_symlink_inode_operations;
 		inode->i_mapping->a_ops = &ntfs_normal_aops;
 	} else if (S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
-		inode->i_op = &ntfs_special_inode_operations;
+		inode->i_op = &ntfsp_special_inode_operations;
 		init_special_inode(inode, inode->i_mode, dev);
 	} else {
 		if (!NInoAttr(NTFS_I(inode))) {
@@ -1195,6 +1191,11 @@ no_data_attr_special_case:
 		/* Setup the operations for this inode. */
 		ntfs_set_vfs_operations(vi, vi->i_mode, dev);
 	}
+
+	if (NVolSysImmutable(vol) && (ni->flags & FILE_ATTR_SYSTEM) &&
+	    !S_ISFIFO(vi->i_mode) && !S_ISSOCK(vi->i_mode) && !S_ISLNK(vi->i_mode))
+		vi->i_flags |= S_IMMUTABLE;
+
 	/*
 	 * The number of 512-byte blocks used on disk (for stat). This is in so
 	 * far inaccurate as it doesn't account for any named streams or other
@@ -2236,8 +2237,7 @@ static void __ntfs_clear_inode(struct ntfs_inode *ni)
 	if (ni->name_len && ni->name != I30 &&
 	    ni->name != reparse_index_name &&
 	    ni->name != R) {
-		/* Catch bugs... */
-		BUG_ON(!ni->name);
+		WARN_ON(!ni->name);
 		kfree(ni->name);
 	}
 }
@@ -2246,8 +2246,8 @@ void ntfs_clear_extent_inode(struct ntfs_inode *ni)
 {
 	ntfs_debug("Entering for inode 0x%lx.", ni->mft_no);
 
-	BUG_ON(NInoAttr(ni));
-	BUG_ON(ni->nr_extents != -1);
+	WARN_ON(NInoAttr(ni));
+	WARN_ON(ni->nr_extents != -1);
 
 	__ntfs_clear_inode(ni);
 	ntfs_destroy_extent_inode(ni);
@@ -2301,7 +2301,7 @@ void ntfs_evict_big_inode(struct inode *vi)
 	if (!vi->i_nlink) {
 		if (!NInoAttr(ni)) {
 			/* Never called with extent inodes */
-			BUG_ON(ni->nr_extents == -1);
+			WARN_ON(ni->nr_extents == -1);
 			ntfs_delete_base_inode(ni);
 		}
 		goto release;
@@ -2345,7 +2345,7 @@ release:
 	}
 
 	if (!atomic_dec_and_test(&ni->count))
-		BUG();
+		WARN_ON(1);
 	if (ni->folio)
 		ntfs_unmap_folio(ni->folio, NULL);
 	kfree(ni->mrec);
@@ -2367,24 +2367,36 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	struct ntfs_volume *vol = NTFS_SB(root->d_sb);
 	int i;
 
-	seq_printf(sf, ",uid=%i", from_kuid_munged(&init_user_ns, vol->uid));
-	seq_printf(sf, ",gid=%i", from_kgid_munged(&init_user_ns, vol->gid));
+	if (uid_valid(vol->uid))
+		seq_printf(sf, ",uid=%i", from_kuid_munged(&init_user_ns, vol->uid));
+	if (gid_valid(vol->gid))
+		seq_printf(sf, ",gid=%i", from_kgid_munged(&init_user_ns, vol->gid));
 	if (vol->fmask == vol->dmask)
 		seq_printf(sf, ",umask=0%o", vol->fmask);
 	else {
 		seq_printf(sf, ",fmask=0%o", vol->fmask);
 		seq_printf(sf, ",dmask=0%o", vol->dmask);
 	}
-	seq_printf(sf, ",nls=%s", vol->nls_map->charset);
+	seq_printf(sf, ",iocharset=%s", vol->nls_map->charset);
 	if (NVolCaseSensitive(vol))
 		seq_puts(sf, ",case_sensitive");
 	if (NVolShowSystemFiles(vol))
-		seq_puts(sf, ",show_sys_files");
+		seq_puts(sf, ",show_sys_files,showmeta");
 	for (i = 0; on_errors_arr[i].val; i++) {
 		if (on_errors_arr[i].val == vol->on_errors)
 			seq_printf(sf, ",errors=%s", on_errors_arr[i].str);
 	}
 	seq_printf(sf, ",mft_zone_multiplier=%i", vol->mft_zone_multiplier);
+	if (NVolSysImmutable(vol))
+		seq_puts(sf, ",sys_immutable");
+	if (!NVolShowHiddenFiles(vol))
+		seq_puts(sf, ",nohidden");
+	if (NVolHideDotFiles(vol))
+		seq_puts(sf, ",hide_dot_files");
+	if (NVolCheckWindowsNames(vol))
+		seq_puts(sf, ",windows_names");
+	if (vol->sb->s_flags & SB_POSIXACL)
+		seq_puts(sf, ",acl");
 	return 0;
 }
 
@@ -2470,7 +2482,10 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 	}
 	si = (struct standard_information *)((u8 *)ctx->attr +
 			le16_to_cpu(ctx->attr->data.resident.value_offset));
-	si->file_attributes = ni->flags;
+	if (si->file_attributes != ni->flags) {
+		si->file_attributes = ni->flags;
+		modified = true;
+	}
 
 	/* Update the creation times if they have changed. */
 	nt = utc2ntfs(ni->i_crtime);
@@ -2716,7 +2731,6 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	}
 
 	if (NInoNonResident(ni) && NInoRunlistDirty(ni)) {
-		BUG_ON(!NInoFullyMapped(ni));
 		down_write(&ni->runlist.lock);
 		err = ntfs_attr_update_mapping_pairs(ni, 0);
 		if (!err)
@@ -3341,9 +3355,13 @@ retry:
 			if (err) {
 				if (err != -ENOENT)
 					ntfs_error(sb, "Attr lookup failed #2");
-				else
+				else if (ctx->attr->type == AT_END)
 					err = -ENOSPC;
-				goto put_err_out;
+				else
+					err = 0;
+
+				if (err)
+					goto put_err_out;
 			}
 		}
 
@@ -3392,11 +3410,11 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	struct folio *folio;
 	struct ntfs_inode *ni = NTFS_I(vi);
 	s64 isize;
-	u32 attr_len, total = 0, offset, index;
+	u32 attr_len, total = 0, offset;
+	pgoff_t index;
 	int err = 0;
 
-	BUG_ON(!ni);
-	BUG_ON(!NInoAttr(ni));
+	WARN_ON(!NInoAttr(ni));
 	if (!count)
 		return 0;
 
@@ -3438,7 +3456,7 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	}
 	mutex_unlock(&ni->mrec_lock);
 
-	index = (u32)(pos / PAGE_SIZE);
+	index = pos >> PAGE_SHIFT;
 	do {
 		/* Update @index and get the next folio. */
 		folio = ntfs_read_mapping_folio(mapping, index);
@@ -3521,7 +3539,7 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 	u8 *addr;
 	int err = 0;
 
-	BUG_ON(NInoNonResident(ni));
+	WARN_ON(NInoNonResident(ni));
 	if (pos + count > PAGE_SIZE) {
 		ntfs_error(vi->i_sb, "Out of write into resident attr %#x", ni->type);
 		return -EINVAL;
@@ -3570,7 +3588,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 	size_t attr_len;
 	s64 ret = 0, written = 0;
 
-	BUG_ON(!NInoNonResident(ni));
+	WARN_ON(!NInoNonResident(ni));
 
 	index = pos >> PAGE_SHIFT;
 	while (count) {
@@ -3673,7 +3691,7 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
 	struct ntfs_attr_search_ctx *ctx;
 	s64 ret;
 
-	BUG_ON(!NInoAttr(ni));
+	WARN_ON(!NInoAttr(ni));
 
 	ctx = ntfs_attr_get_search_ctx(ni->ext.base_ntfs_ino, NULL);
 	if (!ctx) {

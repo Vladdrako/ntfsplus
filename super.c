@@ -7,14 +7,14 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 	/* For bdev_logical_block_size(). */
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
+#include <linux/blkdev.h>	/* For bdev_logical_block_size(). */
+#include <linux/backing-dev.h>
+#include <linux/vfs.h>
+#include <linux/fs_struct.h>
+#include <linux/sched/mm.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
+#include <uapi/linux/ntfs.h>
 
 #include "misc.h"
 #include "logfile.h"
@@ -52,11 +52,18 @@ enum {
 	Opt_fmask,
 	Opt_errors,
 	Opt_nls,
+	Opt_charset,
 	Opt_show_sys_files,
+	Opt_show_meta,
 	Opt_case_sensitive,
 	Opt_disable_sparse,
 	Opt_mft_zone_multiplier,
 	Opt_preallocated_size,
+	Opt_sys_immutable,
+	Opt_nohidden,
+	Opt_hide_dot_files,
+	Opt_check_windows_names,
+	Opt_acl,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -66,12 +73,19 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_u32oct("dmask",			Opt_dmask),
 	fsparam_u32oct("fmask",			Opt_fmask),
 	fsparam_string("nls",			Opt_nls),
+	fsparam_string("iocharset",		Opt_charset),
 	fsparam_enum("errors",			Opt_errors, ntfs_param_enums),
 	fsparam_flag("show_sys_files",		Opt_show_sys_files),
+	fsparam_flag("showmeta",		Opt_show_meta),
 	fsparam_flag("case_sensitive",		Opt_case_sensitive),
 	fsparam_flag("disable_sparse",		Opt_disable_sparse),
 	fsparam_s32("mft_zone_multiplier",	Opt_mft_zone_multiplier),
 	fsparam_u64("preallocated_size",	Opt_preallocated_size),
+	fsparam_flag("sys_immutable",		Opt_sys_immutable),
+	fsparam_flag("nohidden",		Opt_nohidden),
+	fsparam_flag("hide_dot_files",		Opt_hide_dot_files),
+	fsparam_flag("windows_names",		Opt_check_windows_names),
+	fsparam_flag("acl",			Opt_acl),
 	{}
 };
 
@@ -80,7 +94,6 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	struct ntfs_volume *vol = fc->s_fs_info;
 	struct fs_parse_result result;
 	int opt;
-	char *nls_name = NULL;
 
 	opt = fs_parse(fc, ntfs_parameters, param, &result);
 	if (opt < 0)
@@ -106,11 +119,13 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		vol->on_errors = result.uint_32;
 		break;
 	case Opt_nls:
-		if (nls_name && nls_name != param->string)
-			kfree(nls_name);
-		nls_name = param->string;
-		vol->nls_map = load_nls(nls_name);
-		param->string = NULL;
+	case Opt_charset:
+		vol->nls_map = load_nls(param->string);
+		if (!vol->nls_map) {
+			ntfs_error(vol->sb, "Failed to load NLS table '%s'.",
+				   param->string);
+			return -EINVAL;
+		}
 		break;
 	case Opt_mft_zone_multiplier:
 		if (vol->mft_zone_multiplier && vol->mft_zone_multiplier !=
@@ -126,6 +141,7 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			vol->mft_zone_multiplier = result.int_32;
 		break;
 	case Opt_show_sys_files:
+	case Opt_show_meta:
 		if (result.boolean)
 			NVolSetShowSystemFiles(vol);
 		else
@@ -139,6 +155,36 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_preallocated_size:
 		vol->preallocated_size = (loff_t)result.uint_64;
+		break;
+	case Opt_sys_immutable:
+		if (result.boolean)
+			NVolSetSysImmutable(vol);
+		else
+			NVolClearSysImmutable(vol);
+		break;
+	case Opt_nohidden:
+		if (result.boolean)
+			NVolClearShowHiddenFiles(vol);
+		else
+			NVolSetShowHiddenFiles(vol);
+		break;
+	case Opt_hide_dot_files:
+		if (result.boolean)
+			NVolSetHideDotFiles(vol);
+		else
+			NVolClearHideDotFiles(vol);
+		break;
+	case Opt_check_windows_names:
+		if (result.boolean)
+			NVolSetCheckWindowsNames(vol);
+		else
+			NVolClearCheckWindowsNames(vol);
+		break;
+	case Opt_acl:
+		if (result.boolean)
+			fc->sb_flags |= SB_POSIXACL;
+		else
+			fc->sb_flags &= ~SB_POSIXACL;
 		break;
 	default:
 		return -EINVAL;
@@ -356,16 +402,18 @@ static int ntfs_write_volume_flags(struct ntfs_volume *vol, const __le16 flags)
 	mutex_lock(&ni->mrec_lock);
 	if (vol->vol_flags == flags)
 		goto done;
-	BUG_ON(!ni);
+
 	ctx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!ctx) {
 		err = -ENOMEM;
 		goto put_unm_err_out;
 	}
+
 	err = ntfs_attr_lookup(AT_VOLUME_INFORMATION, NULL, 0, 0, 0, NULL, 0,
 			ctx);
 	if (err)
 		goto put_unm_err_out;
+
 	vi = (struct volume_information *)((u8 *)ctx->attr +
 			le16_to_cpu(ctx->attr->data.resident.value_offset));
 	vol->vol_flags = vi->flags = flags;
@@ -412,6 +460,57 @@ int ntfs_clear_volume_flags(struct ntfs_volume *vol, __le16 flags)
 	flags &= VOLUME_FLAGS_MASK;
 	flags = vol->vol_flags & cpu_to_le16(~le16_to_cpu(flags));
 	return ntfs_write_volume_flags(vol, flags);
+}
+
+int ntfs_write_volume_label(struct ntfs_volume *vol, char *label)
+{
+	struct ntfs_inode *vol_ni = NTFS_I(vol->vol_ino);
+	struct ntfs_attr_search_ctx *ctx;
+	__le16 *uname;
+	int uname_len, ret;
+
+	uname_len = ntfs_nlstoucs(vol, label, strlen(label),
+				  &uname, FSLABEL_MAX);
+	if (uname_len < 0) {
+		ntfs_error(vol->sb,
+			"Failed to convert volume label '%s' to Unicode.",
+			label);
+		return uname_len;
+	}
+
+	if (uname_len  > NTFS_MAX_LABEL_LEN) {
+		ntfs_error(vol->sb,
+			   "Volume label is too long (max %d characters).",
+			   NTFS_MAX_LABEL_LEN);
+		kvfree(uname);
+		return -EINVAL;
+	}
+
+	mutex_lock(&vol_ni->mrec_lock);
+	ctx = ntfs_attr_get_search_ctx(vol_ni, NULL);
+	if (!ctx) {
+		ret = -ENOMEM;
+		goto  out;
+	}
+
+	if (!ntfs_attr_lookup(AT_VOLUME_NAME, NULL, 0, 0, 0, NULL, 0,
+			     ctx))
+		ntfs_attr_record_rm(ctx);
+	ntfs_attr_put_search_ctx(ctx);
+
+	ret = ntfs_resident_attr_record_add(vol_ni, AT_VOLUME_NAME, AT_UNNAMED, 0,
+					    (u8 *)uname, uname_len * sizeof(__le16), 0);
+out:
+	mutex_unlock(&vol_ni->mrec_lock);
+	kvfree(uname);
+	mark_inode_dirty_sync(vol->vol_ino);
+
+	if (ret >= 0) {
+		kfree(vol->volume_label);
+		vol->volume_label = kstrdup(label, GFP_KERNEL);
+		ret = 0;
+	}
+	return ret;
 }
 
 /**
@@ -769,10 +868,10 @@ static void ntfs_setup_allocators(struct ntfs_volume *vol)
 	 * On non-standard volumes we do not protect it as the overhead would
 	 * be higher than the speed increase we would get by doing it.
 	 */
-	mft_lcn = (8192 + 2 * vol->cluster_size - 1) / vol->cluster_size;
+	mft_lcn = (8192 + 2 * vol->cluster_size - 1) >> vol->cluster_size_bits;
 	if (mft_lcn * vol->cluster_size < 16 * 1024)
-		mft_lcn = (16 * 1024 + vol->cluster_size - 1) /
-				vol->cluster_size;
+		mft_lcn = (16 * 1024 + vol->cluster_size - 1) >>
+				vol->cluster_size_bits;
 	if (vol->mft_zone_start <= mft_lcn)
 		vol->mft_zone_start = 0;
 	ntfs_debug("vol->mft_zone_start = 0x%llx", vol->mft_zone_start);
@@ -879,8 +978,6 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
 	ntfs_debug("Entering.");
 	/* Compare contents of $MFT and $MFTMirr. */
 	mrecs_per_page = PAGE_SIZE / vol->mft_record_size;
-	BUG_ON(!mrecs_per_page);
-	BUG_ON(!vol->mftmirr_size);
 	index = i = 0;
 	do {
 		u32 bytes;
@@ -955,7 +1052,7 @@ mft_unmap_out:
 	rl2[0].vcn = 0;
 	rl2[0].lcn = vol->mftmirr_lcn;
 	rl2[0].length = (vol->mftmirr_size * vol->mft_record_size +
-			vol->cluster_size - 1) / vol->cluster_size;
+			vol->cluster_size - 1) >> vol->cluster_size_bits;
 	rl2[1].vcn = rl2[0].length;
 	rl2[1].lcn = LCN_ENOENT;
 	rl2[1].length = 0;
@@ -1455,6 +1552,19 @@ iput_volume_failed:
 		ntfs_error(sb, "Failed to get attribute search context.");
 		goto get_ctx_vol_failed;
 	}
+
+	if (!ntfs_attr_lookup(AT_VOLUME_NAME, NULL, 0, 0, 0, NULL, 0, ctx) &&
+	    !ctx->attr->non_resident &&
+	    !(ctx->attr->flags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) &&
+	    le32_to_cpu(ctx->attr->data.resident.value_length) > 0) {
+		err = ntfs_ucstonls(vol, (__le16 *)((u8 *)ctx->attr +
+				    le16_to_cpu(ctx->attr->data.resident.value_offset)),
+				    le32_to_cpu(ctx->attr->data.resident.value_length) / 2,
+				    &vol->volume_label, NTFS_MAX_LABEL_LEN);
+		if (err < 0)
+			vol->volume_label = NULL;
+	}
+
 	if (ntfs_attr_lookup(AT_VOLUME_INFORMATION, NULL, 0, 0, 0, NULL, 0,
 			ctx) || ctx->attr->non_resident || ctx->attr->flags) {
 err_put_vol:
@@ -1674,6 +1784,7 @@ static void ntfs_volume_free(struct ntfs_volume *vol)
 
 	if (vol->lcn_empty_bits_per_page)
 		kvfree(vol->lcn_empty_bits_per_page);
+	kfree(vol->volume_label);
 	kfree(vol);
 }
 
@@ -2252,7 +2363,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto err_out_now;
 	}
 
-	BUG_ON(blocksize != sb->s_blocksize);
 	ntfs_debug("Set device block size to %i bytes (block size bits %i).",
 			blocksize, sb->s_blocksize_bits);
 	/* Determine the size of the device in units of block_size bytes. */
@@ -2291,7 +2401,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 					   vol->sector_size);
 			goto err_out_now;
 		}
-		BUG_ON(blocksize != sb->s_blocksize);
 		vol->nr_blocks = bdev_nr_bytes(sb->s_bdev) >>
 				sb->s_blocksize_bits;
 		ntfs_debug("Changed device block size to %i bytes (block size bits %i) to match volume sector size.",
@@ -2313,7 +2422,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Ntfs measures time in 100ns intervals. */
 	sb->s_time_gran = 100;
 
-	sb->s_xattr = ntfs_xattr_handlers;
+	sb->s_xattr = ntfsp_xattr_handlers;
 	/*
 	 * Now load the metadata required for the page cache and our address
 	 * space operations to function. We do this by setting up a specialised
@@ -2559,6 +2668,8 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 		.nls_map = load_nls_default(),
 		.preallocated_size = NTFS_DEF_PREALLOC_SIZE,
 	};
+
+	NVolSetShowHiddenFiles(vol);
 	init_rwsem(&vol->mftbmp_lock);
 	init_rwsem(&vol->lcnbmp_lock);
 

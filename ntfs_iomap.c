@@ -5,9 +5,9 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-#include 
-#include 
+#include <linux/writeback.h>
+#include <linux/mpage.h>
+#include <linux/uio.h>
 
 #include "aops.h"
 #include "attrib.h"
@@ -162,7 +162,6 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 		base_ni = ni->ext.base_ntfs_ino;
 	else
 		base_ni = ni;
-	BUG_ON(NInoNonResident(ni));
 
 	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx) {
@@ -567,11 +566,8 @@ remap_rl:
 	}
 
 	a = ctx->attr;
-	BUG_ON(a->non_resident);
 	/* The total length of the attribute value. */
 	attr_len = le32_to_cpu(a->data.resident.value_length);
-
-	BUG_ON(offset > attr_len);
 	kattr = (u8 *)a + le16_to_cpu(a->data.resident.value_offset);
 
 	ipage = alloc_page(__GFP_NOWARN | __GFP_IO | __GFP_ZERO);

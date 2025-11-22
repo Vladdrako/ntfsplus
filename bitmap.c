@@ -6,9 +6,105 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
+#include <linux/bitops.h>
+
 #include "bitmap.h"
 #include "aops.h"
 #include "ntfs.h"
+
+int ntfsp_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
+{
+	size_t buf_clusters;
+	pgoff_t index, start_index, end_index;
+	struct file_ra_state *ra;
+	struct folio *folio;
+	unsigned long *bitmap;
+	char *kaddr;
+	u64 end, trimmed = 0, start_buf, end_buf, end_cluster;
+	u64 start_cluster = range->start >> vol->cluster_size_bits;
+	u32 dq = bdev_discard_granularity(vol->sb->s_bdev);
+	int ret = 0;
+
+	if (!dq)
+		dq = vol->cluster_size;
+
+	if (start_cluster >= vol->nr_clusters)
+		return -EINVAL;
+
+	if (range->len == (u64)-1)
+		end_cluster = vol->nr_clusters;
+	else {
+		end_cluster = (range->start + range->len + vol->cluster_size - 1) >>
+			vol->cluster_size_bits;
+		if (end_cluster > vol->nr_clusters)
+			end_cluster = vol->nr_clusters;
+	}
+
+	ra = kzalloc(sizeof(*ra), GFP_NOFS);
+	if (!ra)
+		return -ENOMEM;
+
+	buf_clusters = PAGE_SIZE * 8;
+	start_index = start_cluster >> 15;
+	end_index = (end_cluster + buf_clusters - 1) >> 15;
+
+	for (index = start_index; index < end_index; index++) {
+		folio = filemap_lock_folio(vol->lcnbmp_ino->i_mapping, index);
+		if (IS_ERR(folio)) {
+			page_cache_sync_readahead(vol->lcnbmp_ino->i_mapping, ra, NULL,
+					index, end_index - index);
+			folio = ntfs_read_mapping_folio(vol->lcnbmp_ino->i_mapping, index);
+			if (!IS_ERR(folio))
+				folio_lock(folio);
+		}
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio);
+			goto out_free;
+		}
+
+		kaddr = kmap_local_folio(folio, 0);
+		bitmap = (unsigned long *)kaddr;
+
+		start_buf = max_t(u64, index * buf_clusters, start_cluster);
+		end_buf = min_t(u64, (index + 1) * buf_clusters, end_cluster);
+
+		end = start_buf;
+		while (end < end_buf) {
+			u64 aligned_start, aligned_count;
+			u64 start = find_next_zero_bit(bitmap, end_buf - start_buf,
+					end - start_buf) + start_buf;
+			if (start >= end_buf)
+				break;
+
+			end = find_next_bit(bitmap, end_buf - start_buf,
+					start - start_buf) + start_buf;
+
+			aligned_start = ALIGN(start << vol->cluster_size_bits, dq);
+			aligned_count = ALIGN_DOWN((end - start) << vol->cluster_size_bits, dq);
+			if (aligned_count >= range->minlen) {
+				ret = blkdev_issue_discard(vol->sb->s_bdev, aligned_start >> 9,
+						aligned_count >> 9, GFP_NOFS);
+				if (ret)
+					goto out_unmap;
+				trimmed += aligned_count;
+			}
+		}
+
+out_unmap:
+		kunmap_local(kaddr);
+		folio_unlock(folio);
+		folio_put(folio);
+
+		if (ret)
+			goto out_free;
+	}
+
+	range->len = trimmed;
+
+out_free:
+	kfree(ra);
+	return ret;
+}
 
 /**
  * __ntfs_bitmap_set_bits_in_run - set a run of bits in a bitmap to a value
@@ -37,14 +133,14 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 
-	BUG_ON(!vi);
 	ntfs_debug("Entering for i_ino 0x%lx, start_bit 0x%llx, count 0x%llx, value %u.%s",
 			vi->i_ino, (unsigned long long)start_bit,
 			(unsigned long long)cnt, (unsigned int)value,
 			is_rollback ? " (rollback)" : "");
-	BUG_ON(start_bit < 0);
-	BUG_ON(cnt < 0);
-	BUG_ON(value > 1);
+
+	if (start_bit < 0 || cnt < 0 || value > 1)
+		return -EINVAL;
+
 	/*
 	 * Calculate the indices for the pages containing the first and last
 	 * bits, i.e. @start_bit and @start_bit + @cnt - 1, respectively.
@@ -108,7 +204,8 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	/* If we are not in the last page, deal with all subsequent pages. */
 	while (index < end_index) {
-		BUG_ON(cnt <= 0);
+		if (cnt <= 0)
+			goto rollback;
 
 		/* Update @index and get the next folio. */
 		flush_dcache_folio(folio);
@@ -143,7 +240,7 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	if (cnt) {
 		u8 *byte;
 
-		BUG_ON(cnt > 7);
+		WARN_ON(cnt > 7);
 
 		bit = cnt;
 		byte = kaddr + len;

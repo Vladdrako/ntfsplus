@@ -7,14 +7,38 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
-#include 
-#include 
+#include <linux/exportfs.h>
+#include <linux/iversion.h>
 
 #include "ntfs.h"
 #include "misc.h"
 #include "index.h"
 #include "reparse.h"
 #include "ea.h"
+
+static const __le16 aux_name_le[3] = {
+	cpu_to_le16('A'), cpu_to_le16('U'), cpu_to_le16('X')
+};
+
+static const __le16 con_name_le[3] = {
+	cpu_to_le16('C'), cpu_to_le16('O'), cpu_to_le16('N')
+};
+
+static const __le16 com_name_le[3] = {
+	cpu_to_le16('C'), cpu_to_le16('O'), cpu_to_le16('M')
+};
+
+static const __le16 lpt_name_le[3] = {
+	cpu_to_le16('L'), cpu_to_le16('P'), cpu_to_le16('T')
+};
+
+static const __le16 nul_name_le[3] = {
+	cpu_to_le16('N'), cpu_to_le16('U'), cpu_to_le16('L')
+};
+
+static const __le16 prn_name_le[3] = {
+	cpu_to_le16('P'), cpu_to_le16('R'), cpu_to_le16('N')
+};
 
 static inline int ntfs_check_bad_char(const unsigned short *wc,
 		unsigned int wc_len)
@@ -29,6 +53,47 @@ static inline int ntfs_check_bad_char(const unsigned short *wc,
 			return -EINVAL;
 	}
 
+	return 0;
+}
+
+static int ntfs_check_bad_windows_name(struct ntfs_volume *vol,
+				       const unsigned short *wc,
+				       unsigned int wc_len)
+{
+	if (ntfs_check_bad_char(wc, wc_len))
+		return -EINVAL;
+
+	if (!NVolCheckWindowsNames(vol))
+		return 0;
+
+	/* Check for trailing space or dot. */
+	if (wc_len > 0 &&
+	    (wc[wc_len - 1] == cpu_to_le16(' ') ||
+	    wc[wc_len - 1] == cpu_to_le16('.')))
+		return -EINVAL;
+
+	if (wc_len == 3 || (wc_len > 3 && wc[3] == cpu_to_le16('.'))) {
+		__le16 *upcase = vol->upcase;
+		u32 size = vol->upcase_len;
+
+		if (ntfs_are_names_equal(wc, 3, aux_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, con_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, nul_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, prn_name_le, 3, IGNORE_CASE, upcase, size))
+			return -EINVAL;
+	}
+
+	if (wc_len == 4 || (wc_len > 4 && wc[4] == cpu_to_le16('.'))) {
+		__le16 *upcase = vol->upcase;
+		u32 size = vol->upcase_len, port;
+
+		if (ntfs_are_names_equal(wc, 3, com_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, lpt_name_le, 3, IGNORE_CASE, upcase, size)) {
+			port = le16_to_cpu(wc[3]);
+			if (port >= '1' && port <= '9')
+				return -EINVAL;
+		}
+	}
 	return 0;
 }
 
@@ -578,6 +643,8 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	}
 	if (!S_ISREG(mode) && !S_ISDIR(mode))
 		fn->file_attributes = FILE_ATTR_SYSTEM;
+	if (NVolHideDotFiles(vol) && (name_len > 0 && name[0] == '.'))
+		fn->file_attributes |= FILE_ATTR_HIDDEN;
 	fn->creation_time = fn->last_data_change_time = utc2ntfs(ni->i_crtime);
 	fn->last_mft_change_time = fn->last_access_time = fn->creation_time;
 	memcpy(fn->file_name, name, name_len * sizeof(__le16));
@@ -606,6 +673,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	mutex_unlock(&dir_ni->mrec_lock);
 	mutex_unlock(&ni->mrec_lock);
 
+	ni->flags = fn->file_attributes;
 	/* Set the sequence number. */
 	vi->i_generation = ni->seq_no;
 	set_nlink(vi, 1);
@@ -613,7 +681,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 
 #ifdef CONFIG_NTFSPLUS_FS_POSIX_ACL
 	if (!S_ISLNK(mode) && (sb->s_flags & SB_POSIXACL)) {
-		err = ntfs_init_acl(idmap, vi, dir);
+		err = ntfsp_init_acl(idmap, vi, dir);
 		if (err)
 			goto err_out;
 	} else
@@ -685,7 +753,7 @@ static int ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		return uname_len;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -945,7 +1013,7 @@ static int ntfs_unlink(struct inode *dir, struct dentry *dentry)
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -989,7 +1057,7 @@ static struct dentry *ntfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		return ERR_PTR(-ENOMEM);
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return ERR_PTR(err);
@@ -1031,7 +1099,7 @@ static int ntfs_rmdir(struct inode *dir, struct dentry *dentry)
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -1118,6 +1186,8 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 			fn->allocated_size = cpu_to_le64(ni->allocated_size);
 		fn->data_size = cpu_to_le64(ni->data_size);
 	}
+	if (NVolHideDotFiles(dir_ni->vol) && (name_len > 0 && name[0] == '.'))
+		fn->file_attributes |= FILE_ATTR_HIDDEN;
 
 	fn->creation_time = utc2ntfs(ni->i_crtime);
 	fn->last_data_change_time = utc2ntfs(inode_get_mtime(vi));
@@ -1193,7 +1263,7 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname_new, new_name_len);
+	err = ntfs_check_bad_windows_name(vol, uname_new, new_name_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname_new);
 		return err;
@@ -1339,7 +1409,7 @@ static int ntfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		goto out;
 	}
 
-	err = ntfs_check_bad_char(usrc, usrc_len);
+	err = ntfs_check_bad_windows_name(vol, usrc, usrc_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, usrc);
 		goto out;
@@ -1395,7 +1465,7 @@ static int ntfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -1490,11 +1560,11 @@ const struct inode_operations ntfs_dir_inode_ops = {
 	.mkdir		= ntfs_mkdir,
 	.rmdir		= ntfs_rmdir,
 	.rename		= ntfs_rename,
-	.get_acl	= ntfs_get_acl,
-	.set_acl	= ntfs_set_acl,
-	.listxattr	= ntfs_listxattr,
-	.setattr	= ntfs_setattr,
-	.getattr	= ntfs_getattr,
+	.get_acl	= ntfsp_get_acl,
+	.set_acl	= ntfsp_set_acl,
+	.listxattr	= ntfsp_listxattr,
+	.setattr	= ntfsp_setattr,
+	.getattr	= ntfsp_getattr,
 	.symlink	= ntfs_symlink,
 	.mknod		= ntfs_mknod,
 	.link		= ntfs_link,
